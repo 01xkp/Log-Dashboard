@@ -34,7 +34,17 @@ const UUID = /\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b/gi;
 const EMAIL_ADDRESS = /\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b/i;
 const EMAIL_ADDRESSES = /\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}\b/gi;
 const REQUIRED_IDENTIFIER = /^[a-zA-Z][a-zA-Z0-9_.-]{0,127}$/;
-const TRACE_IDENTIFIER = /^[a-f0-9]{6,64}$/i;
+const TRACE_IDENTIFIER = /^[a-f0-9]{6,32}$/i;
+const UNSAFE_IDENTIFIER_SEGMENTS = new Set([
+  'authorization',
+  'nonce',
+  'payload',
+  'proof',
+  'secret',
+  'token',
+]);
+const UUID_IDENTIFIER = /^\{?[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\}?$/i;
+const COMPACT_UUID_IDENTIFIER = /^[a-f0-9]{32}$/i;
 const SUCCESS_RESULT = /^(?:success|succeeded|completed|accepted|ready|confirmed)$/i;
 const FAILURE_RESULT = /^(?:failed|timeout|error|rejected)$/i;
 const CANCELLATION_RESULT = /^(?:cancelled|canceled|revoked)$/i;
@@ -47,6 +57,36 @@ const URL_PREFIX = /(?:https?|sftp|file):\/\//i;
 const FILENAME_SENSITIVE_FRAGMENT = /(?:security(?:[\s_-]?code)?|pass(?:[\s_-]?code)?|verification[\s_-]?code|password|private[\s_-]?key|authorization|token|secret|credential|api[\s_-]?key|account|username|remote[\s_-]?path|storage[\s_-]?key|tenant[\s_-]?code|email)|(?:^|[._=-])(?:pin|host|server|directory|path)(?:$|[._=-])/i;
 const MAX_SAFE_LOG_FILENAME_LENGTH = 120;
 const DEFAULT_SAFE_LOG_FILENAME = '日志文件.log';
+const EVT_PACKET_OMITTED_SUMMARIES = new Set([
+  'evt_malformed_content_omitted',
+  'evt_authentication_content_redacted',
+  'evt_sensitive_content_omitted',
+  'evt_unrecognized_content_omitted',
+]);
+const EVT_CONTROL_FRAME_SUMMARY = /^evt_control cmd=(0x[0-9A-F]{2}) content=(empty|[0-9A-F]{2}(?: [0-9A-F]{2}){0,17})$/;
+const EVT_CONTROL_WIRE_SUMMARY = /^evt_control cmd=(0x[0-9A-F]{2}) wire=([0-9A-F]{2}(?: [0-9A-F]{2}){5,20})$/;
+const EVT_AUTHENTICATION_FRAME_SUMMARY = /^evt_authentication cmd=0x09 action=0x0[0-2] security_code=redacted$/;
+const EVT_AUTHENTICATION_WIRE_SUMMARY = /^evt_authentication cmd=0x09 action=0x0([0-2]) wire=ED 0A 00 09 0([0-2]) \*\* \*\* \*\* \*\* \*\* \*\* [0-9A-F]{2} [0-9A-F]{2}$/;
+const PACKET_SUMMARY_FIELD_START = /(?:^|\s)(frame_summary|wire_summary)=/g;
+const FRAME_SUMMARY_VALUE = /^(evt_(?:malformed_content_omitted|authentication_content_redacted|sensitive_content_omitted|unrecognized_content_omitted)|evt_control cmd=0x[0-9A-F]{2} content=(?:empty|[0-9A-F]{2}(?: [0-9A-F]{2}){0,17})|evt_authentication cmd=0x09 action=0x0[0-2] security_code=redacted)(?=\s+[a-z][a-z0-9_]*=|\s*\||$)/;
+const WIRE_SUMMARY_VALUE = /^(evt_(?:malformed_content_omitted|authentication_content_redacted|sensitive_content_omitted|unrecognized_content_omitted)|evt_control cmd=0x[0-9A-F]{2} wire=[0-9A-F]{2}(?: [0-9A-F]{2}){5,20}|evt_authentication cmd=0x09 action=0x0[0-2] wire=ED 0A 00 09 0[0-2] \*\* \*\* \*\* \*\* \*\* \*\* [0-9A-F]{2} [0-9A-F]{2})(?=\s+[a-z][a-z0-9_]*=|\s*\||$)/;
+type PacketSummaryKey = 'frame_summary' | 'wire_summary';
+
+// These explanations are deliberately emitted by Flutter's sanitizer. They
+// mention the security-code flow but never contain a code, so preserve them
+// instead of applying the generic Chinese sensitive-value redaction rule.
+const FLUTTER_SAFE_REASON_VALUES = new Set([
+  'security_code_sheet_cancelled',
+  '【解绑预检】设备尚未完成认证并进入可用状态，未打开安全码输入，也未发送 Action=2',
+  '【解绑预检】设备空闲、同步状态为空闲且文件列表为空，允许打开安全码输入',
+  '【解绑预检】设备处于空闲、未同步文件为空，可以打开安全码输入',
+  '【预认证】已收到脱敏设备信息，可据 DeviceCode 取得安全码',
+  '【解绑预检】设备正在录音或已暂停录音，请先结束录音后再解绑。 未打开安全码输入，也未发送 Action=2',
+  '【解绑预检】设备录音状态异常，无法确认可以安全解绑。 未打开安全码输入，也未发送 Action=2',
+  '【解绑预检】设备正在同步或同步状态异常，请完成文件同步后再解绑。 未打开安全码输入，也未发送 Action=2',
+  '【解绑预检】设备仍有未同步录音文件，请先完成文件同步后再解绑。 未打开安全码输入，也未发送 Action=2',
+  '【解绑预检】无法确认设备录音、同步和文件状态，请重新连接后完成文件同步再解绑。 未打开安全码输入，也未发送 Action=2',
+]);
 
 /**
  * Replaces values that are unsafe to keep in browser state. This is a second
@@ -131,6 +171,14 @@ export function redactFieldValue(key: string, value: unknown): string {
   if (!raw) {
     return '';
   }
+  if (normalizedKey === 'reason' && FLUTTER_SAFE_REASON_VALUES.has(raw)) {
+    return raw;
+  }
+  if (isPacketSummaryKey(normalizedKey)) {
+    return isPersistableEvtPacketSummary(normalizedKey, raw)
+      ? raw
+      : '[已隐藏]';
+  }
   if (normalizedKey === 'raw_packet_hex') {
     return 'omitted';
   }
@@ -151,10 +199,13 @@ export function redactFieldValue(key: string, value: unknown): string {
  */
 export function parseEvtLogFields(detail: string): EvtLogFields {
   const fields: Record<string, string> = {};
-  const normalized = redactSensitiveContent(detail);
-  const keyPattern = /(?:^|\s)([a-zA-Z][a-zA-Z0-9_]*)=([^|]*?)(?=(?:\s+[a-zA-Z][a-zA-Z0-9_]*=)|\s*\||$)/g;
+  const detailWithoutPacketSummaries = extractPacketSummaryFields(detail, fields);
+  // App-emitted field names are lowercase contract identifiers. Restricting
+  // the delimiter lookahead to that grammar keeps prose such as `Action=2`
+  // inside a safe reason value instead of inventing an `action` field.
+  const keyPattern = /(?:^|\s)([a-z][a-z0-9_]*)=([^|]*?)(?=(?:\s+[a-z][a-z0-9_]*=)|\s*\||$)/g;
 
-  for (const match of normalized.matchAll(keyPattern)) {
+  for (const match of detailWithoutPacketSummaries.matchAll(keyPattern)) {
     const key = match[1].toLowerCase();
     addSafeField(fields, key, match[2]);
   }
@@ -193,9 +244,138 @@ function addSafeField(fields: Record<string, string>, key: string, rawValue: unk
     return;
   }
 
+  if (isPacketSummaryKey(key)) {
+    if (isPersistableEvtPacketSummary(key, raw)) {
+      fields[key] = raw;
+    }
+    return;
+  }
+  if (key === 'critical') {
+    if (raw === 'true' || raw === 'false') {
+      fields[key] = raw;
+    }
+    return;
+  }
+  if (key === 'reported_write_payload') {
+    if (/^\d+$/.test(raw)) {
+      fields[key] = raw;
+    }
+    return;
+  }
+
   const value = redactFieldValue(key, raw);
   if (value) {
     fields[key] = value;
+  }
+}
+
+/**
+ * Flutter logs packet summaries as values that themselves contain `key=value`
+ * fragments. Extract approved forms before the ordinary field scanner so
+ * `action=...` or `wire=...` inside a summary cannot become separate fields.
+ */
+function extractPacketSummaryFields(detail: string, fields: Record<string, string>): string {
+  let cursor = 0;
+  let stripped = '';
+
+  for (const match of detail.matchAll(PACKET_SUMMARY_FIELD_START)) {
+    const key = match[1] as PacketSummaryKey;
+    const matchIndex = match.index ?? 0;
+    const assignmentStart = matchIndex + match[0].length - `${key}=`.length;
+    if (assignmentStart < cursor) {
+      continue;
+    }
+    const valueStart = assignmentStart + key.length + 1;
+    const value = readPacketSummaryValue(key, detail.slice(valueStart));
+    if (value === null || !isPersistableEvtPacketSummary(key, value)) {
+      continue;
+    }
+
+    fields[key] = value;
+    stripped += detail.slice(cursor, assignmentStart);
+    stripped += ' '.repeat(key.length + 1 + value.length);
+    cursor = valueStart + value.length;
+  }
+
+  return cursor === 0 ? detail : `${stripped}${detail.slice(cursor)}`;
+}
+
+function readPacketSummaryValue(key: PacketSummaryKey, source: string): string | null {
+  const match = (key === 'frame_summary'
+    ? FRAME_SUMMARY_VALUE
+    : WIRE_SUMMARY_VALUE).exec(source);
+  return match?.[1] ?? null;
+}
+
+function isPacketSummaryKey(value: string): value is PacketSummaryKey {
+  return value === 'frame_summary' || value === 'wire_summary';
+}
+
+/** Mirrors Flutter's EvtPacketLogSummary.isPersistableSummary contract. */
+function isPersistableEvtPacketSummary(key: PacketSummaryKey, value: string): boolean {
+  if (EVT_PACKET_OMITTED_SUMMARIES.has(value)) {
+    return true;
+  }
+
+  if (key === 'frame_summary') {
+    if (EVT_AUTHENTICATION_FRAME_SUMMARY.test(value)) {
+      return true;
+    }
+    const match = EVT_CONTROL_FRAME_SUMMARY.exec(value);
+    if (!match) {
+      return false;
+    }
+    const command = Number.parseInt(match[1].slice(2), 16);
+    const contentLength = match[2] === 'empty' ? 0 : match[2].split(' ').length;
+    return isSafeEvtControlFrame(command, contentLength);
+  }
+
+  const authenticationMatch = EVT_AUTHENTICATION_WIRE_SUMMARY.exec(value);
+  if (authenticationMatch) {
+    return authenticationMatch[1] === authenticationMatch[2];
+  }
+  const match = EVT_CONTROL_WIRE_SUMMARY.exec(value);
+  if (!match) {
+    return false;
+  }
+  const command = Number.parseInt(match[1].slice(2), 16);
+  const bytes = match[2].split(' ').map((part) => Number.parseInt(part, 16));
+  const declaredLength = bytes[1] | (bytes[2] << 8);
+  return bytes[0] === 0xed
+    && bytes[3] === command
+    && declaredLength >= 3
+    && bytes.length === declaredLength + 3
+    && isSafeEvtControlFrame(command, declaredLength - 3);
+}
+
+function isSafeEvtControlFrame(command: number, contentLength: number): boolean {
+  switch (command) {
+    case 0x02:
+      return contentLength === 12;
+    case 0x82:
+      return contentLength === 1 || contentLength === 4;
+    case 0x06:
+      return contentLength === 1 || contentLength === 3;
+    case 0x86:
+      return contentLength === 3 || contentLength === 8;
+    case 0x07:
+      return contentLength === 1;
+    case 0x87:
+      return contentLength === 1 || contentLength === 8;
+    case 0x89:
+      return contentLength === 1;
+    case 0x05:
+    case 0x11:
+    case 0x21:
+      return contentLength === 0;
+    case 0x91:
+      return contentLength === 3;
+    case 0x85:
+      return contentLength === 8;
+    case 0xa1:
+      return contentLength === 2;
+    default:
+      return false;
   }
 }
 
@@ -233,14 +413,14 @@ export function parseEvtLogLine(source: string, lineNumber = 1): EvtLogLine {
   const parts = sourceText
     .slice(timestampMatch.index)
     .split(/\s*\|\s*/)
-    .map((part) => redactSensitiveContent(part).trim());
+    .map((part) => part.trim());
 
   if (parts.length < 8) {
     return unparsedLine(lineNumber, 'not_enough_columns', 'EVT 固定字段不足，无法解析。');
   }
 
   const [time, level, scope, trace, operation, stage, event, result, elapsed, ...fieldParts] = parts;
-  if (!time || !level || !scope || !event || !isMachineIdentifier(level) || !isMachineIdentifier(scope) || !isMachineIdentifier(event)) {
+  if (!time || !level || !scope || !event || !isSafeMachineIdentifier(level) || !isSafeMachineIdentifier(scope) || !isMachineIdentifier(event)) {
     return unparsedLine(lineNumber, 'invalid_required_field', 'EVT 必填字段格式无效。');
   }
 
@@ -255,6 +435,7 @@ export function parseEvtLogLine(source: string, lineNumber = 1): EvtLogLine {
     elapsedMs = parseElapsedMs(elapsed);
   }
 
+  const normalizedEvent = normalizeEventIdentifier(event);
   const parsed: ParsedEvtLogLine = {
     parseStatus: 'parsed',
     lineNumber,
@@ -262,14 +443,14 @@ export function parseEvtLogLine(source: string, lineNumber = 1): EvtLogLine {
     timestamp: time,
     level: level.toUpperCase(),
     scope: scope.toUpperCase(),
-    traceId: normalizeOptionalIdentifier(trace),
+    traceId: normalizeTraceIdentifier(trace),
     operation: normalizeOptionalIdentifier(operation),
     stage: normalizeOptionalIdentifier(stage),
-    event: event.toLowerCase(),
+    event: normalizedEvent,
     result: normalizeOptionalIdentifier(result)?.toLowerCase() ?? null,
     elapsedMs,
     fields: parseEvtLogFields(details),
-    direction: inferEvtLogDirection(prefix, scope, event),
+    direction: inferEvtLogDirection(prefix, scope, normalizedEvent),
     summary: '',
     warnings,
   };
@@ -346,10 +527,11 @@ function parseEvtLogContentItem(item: EvtLogContentItem, fallbackLineNumber: num
   const level = String(item.level ?? '').trim();
   const scope = String(item.scope ?? '').trim();
   const event = String(item.event ?? '').trim().toLowerCase();
-  if (!isValidContentTimestamp(timestamp) || !isMachineIdentifier(level) || !isMachineIdentifier(scope) || !isMachineIdentifier(event)) {
+  if (!isValidContentTimestamp(timestamp) || !isSafeMachineIdentifier(level) || !isSafeMachineIdentifier(scope) || !isMachineIdentifier(event)) {
     return unparsedLine(lineNumber, 'invalid_required_field', '服务端返回的结构化日志字段无效。');
   }
 
+  const normalizedEvent = normalizeEventIdentifier(event);
   const parsed: ParsedEvtLogLine = {
     parseStatus: 'parsed',
     lineNumber,
@@ -357,14 +539,14 @@ function parseEvtLogContentItem(item: EvtLogContentItem, fallbackLineNumber: num
     timestamp,
     level: level.toUpperCase(),
     scope: scope.toUpperCase(),
-    traceId: normalizeOptionalIdentifier(item.trace_id),
+    traceId: normalizeTraceIdentifier(item.trace_id),
     operation: normalizeOptionalIdentifier(item.operation),
     stage: normalizeOptionalIdentifier(item.stage),
-    event,
+    event: normalizedEvent,
     result: normalizeOptionalIdentifier(item.result)?.toLowerCase() ?? null,
     elapsedMs: parseContentElapsedMs(item.elapsed_ms),
     fields: sanitizeEvtLogFields(item.fields),
-    direction: inferEvtLogDirection('', scope, event),
+    direction: inferEvtLogDirection('', scope, normalizedEvent),
     summary: '',
     warnings: [],
   };
@@ -1088,10 +1270,22 @@ function parseElapsedMs(value: string | undefined): number | null {
 
 function normalizeOptionalIdentifier(value: string | undefined): string | null {
   const normalized = String(value ?? '').trim();
-  if (!normalized || normalized === '-' || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(normalized)) {
+  if (!normalized || normalized === '-' || !isSafeOptionalIdentifier(normalized)) {
     return null;
   }
-  return redactSensitiveContent(normalized);
+  // The value has already passed the identifier grammar and sensitive-segment
+  // checks. Running the generic value redactor here would mistake a legitimate
+  // 12-character trace-like identifier for a device secret.
+  return normalized;
+}
+
+function normalizeTraceIdentifier(value: string | undefined): string | null {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  return TRACE_IDENTIFIER.test(normalized) ? normalized : null;
+}
+
+function normalizeEventIdentifier(value: string): string {
+  return isSafeMachineIdentifier(value) ? value.toLowerCase() : 'unknown_event';
 }
 
 function normalizeCommand(value: string | undefined): string | null {
@@ -1101,6 +1295,41 @@ function normalizeCommand(value: string | undefined): string | null {
 
 function isMachineIdentifier(value: string): boolean {
   return REQUIRED_IDENTIFIER.test(value) && !SENSITIVE_KEY.test(value);
+}
+
+function isSafeOptionalIdentifier(value: string): boolean {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(value)) {
+    return false;
+  }
+  const normalized = value.toLowerCase();
+  if (UUID_IDENTIFIER.test(normalized) || COMPACT_UUID_IDENTIFIER.test(normalized)) {
+    return false;
+  }
+  return normalized
+    .split('_')
+    .every((segment) => (
+      !UNSAFE_IDENTIFIER_SEGMENTS.has(segment)
+      && !UUID_IDENTIFIER.test(segment)
+      && !COMPACT_UUID_IDENTIFIER.test(segment)
+    ));
+}
+
+/** Mirrors the Flutter sanitizer's event/metadata identifier boundary. */
+function isSafeMachineIdentifier(value: string): boolean {
+  if (!isMachineIdentifier(value)) {
+    return false;
+  }
+  const normalized = value.toLowerCase();
+  if (UUID_IDENTIFIER.test(normalized) || COMPACT_UUID_IDENTIFIER.test(normalized)) {
+    return false;
+  }
+  return normalized
+    .split('_')
+    .every((segment) => (
+      !UNSAFE_IDENTIFIER_SEGMENTS.has(segment)
+      && !UUID_IDENTIFIER.test(segment)
+      && !COMPACT_UUID_IDENTIFIER.test(segment)
+    ));
 }
 
 function hasAnyToken(value: string, tokens: readonly string[]): boolean {

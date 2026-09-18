@@ -134,6 +134,32 @@ describe('diagnostic log API client', () => {
     });
   });
 
+  it('explains that the local dashboard proxy needs a server-side credential', async () => {
+    const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      code: 'dashboard_configuration_missing',
+    }), { status: 503 }));
+    const api = createDiagnosticLogApi({ baseUrl: 'http://localhost:5173', fetch });
+
+    await expect(api.list()).rejects.toMatchObject({
+      message: '看板查询凭证未配置，请使用受保护的 token 启动本地联调。',
+      code: 'dashboard_configuration_missing',
+      status: 503,
+    });
+  });
+
+  it('keeps a BFF contract failure distinct from a network failure', async () => {
+    const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      code: 'upstream_contract_invalid',
+    }), { status: 502 }));
+    const api = createDiagnosticLogApi({ baseUrl: 'https://logs.example.test', fetch });
+
+    await expect(api.list()).rejects.toMatchObject({
+      message: '日志服务响应不符合 EVT 看板契约，已停止加载以避免误判。',
+      code: 'upstream_contract_invalid',
+      status: 502,
+    });
+  });
+
   it('validates the list response and drops unapproved fields before returning it', async () => {
     const fetch = vi.fn().mockResolvedValue(jsonResponse({
       page: 1,
@@ -142,6 +168,7 @@ describe('diagnostic log API client', () => {
       items: [{
         id: 'log-001',
         received_at: '2026-09-17T01:00:00.000Z',
+        uploaded_at: '2026-09-17T01:00:03.000Z',
         status: 'stored',
         app_version: '0.0.4',
         bytes: 128,
@@ -158,6 +185,7 @@ describe('diagnostic log API client', () => {
       items: [{
         id: 'log-001',
         received_at: '2026-09-17T01:00:00.000Z',
+        uploaded_at: '2026-09-17T01:00:03.000Z',
         status: 'stored',
         app_version: '0.0.4',
         bytes: 128,
@@ -170,6 +198,7 @@ describe('diagnostic log API client', () => {
     ['错误分页类型', { page: '1' }],
     ['错误日志状态', { items: [{ ...validListItem(), status: 'unknown' }] }],
     ['带路径的日志 ID', { items: [{ ...validListItem(), id: '../private-log' }] }],
+    ['错误 App 上传时间', { items: [{ ...validListItem(), uploaded_at: '2026-09-17 01:00:03' }] }],
   ])('rejects %s in a list response', async (_label, override) => {
     const fetch = vi.fn().mockResolvedValue(jsonResponse({ ...validListResponse(), ...override }));
     const api = createDiagnosticLogApi({ baseUrl: 'https://logs.example.test', fetch });
@@ -183,6 +212,7 @@ describe('diagnostic log API client', () => {
       status: 'stored',
       source_filename: 'aipin-2026-09-17.log',
       received_at: '2026-09-17T01:00:00.000Z',
+      uploaded_at: '2026-09-17T01:00:03.000Z',
       device_ref: '...8423',
       bytes: 128,
       available_actions: ['read', 'download'],
@@ -195,6 +225,7 @@ describe('diagnostic log API client', () => {
       status: 'stored',
       source_filename: 'aipin-2026-09-17.log',
       received_at: '2026-09-17T01:00:00.000Z',
+      uploaded_at: '2026-09-17T01:00:03.000Z',
       device_ref: '...8423',
       bytes: 128,
       available_actions: ['read', 'download'],
@@ -206,6 +237,7 @@ describe('diagnostic log API client', () => {
     ['错误权限字段类型', { available_actions: 'download' }],
     ['未知权限动作', { available_actions: ['read', 'unexpected'] }],
     ['错误详情状态', { status: 'unknown' }],
+    ['错误详情 App 上传时间', { uploaded_at: '2026-09-17 01:00:03' }],
   ])('rejects %s in a detail response', async (_label, override) => {
     const fetch = vi.fn().mockResolvedValue(jsonResponse({ ...validDetailResponse(), ...override }));
     const api = createDiagnosticLogApi({ baseUrl: 'https://logs.example.test', fetch });

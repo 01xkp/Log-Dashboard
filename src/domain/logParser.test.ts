@@ -2,12 +2,29 @@ import { describe, expect, it } from 'vitest';
 import {
   aggregateEvtFlowNodes,
   parseEvtLogContentItems,
+  parseEvtLogLine,
   parseEvtLogText,
   redactSensitiveContent,
   sanitizeLogFilename,
 } from './logParser';
 
 describe('EVT log parser', () => {
+  it('parses the current Flutter reconnect and lifecycle line contract', () => {
+    const result = parseEvtLogText([
+      '2026-09-18T01:00:00.000Z | INFO | RECONNECT | - | device_reconnect | waitingToRetry | reconnect_retry_scheduled | pending | - | attempt=2 cycle=3 phase=waitingToRetry',
+      '2026-09-18T01:00:00.001Z | INFO | APP_LIFECYCLE | - | - | - | app_resumed | completed | -',
+    ].join('\n'));
+
+    expect(result).toMatchObject({ parsedCount: 2, unparsedCount: 0, redactedCount: 0 });
+    expect(result.records[0]).toMatchObject({
+      scope: 'RECONNECT',
+      operation: 'device_reconnect',
+      stage: 'waitingToRetry',
+      fields: { attempt: '2', cycle: '3', phase: 'waitingToRetry' },
+    });
+    expect(aggregateEvtFlowNodes(result.records).map((node) => node.category)).toEqual(['reconnect', 'other']);
+  });
+
   it('only marks authentication successful after request, matching response, and business completion', () => {
     const result = parseEvtLogText([
       '2026-09-17T01:00:00.000Z | INFO | CMD | ab12cd | device_authenticate | fa19_write | evt_command_transmit_started | pending | - | command=0x09 expected_command=0x89',
@@ -121,6 +138,78 @@ describe('EVT log parser', () => {
     expect(redactSensitiveContent('wire=ED 0A 00 09 00 31 32 33 34 35 36')).not.toContain('31 32 33');
   });
 
+  it('keeps only Flutter-approved packet summaries and scalar transport fields', () => {
+    const frameSummary = 'evt_control cmd=0x07 content=01';
+    const wireSummary = 'evt_control cmd=0x07 wire=ED 04 00 07 01 00 00';
+    const local = parseEvtLogText(
+      `2026-09-17T01:00:00.000Z | INFO | CMD | - | - | write | evt_command_transmit_started | pending | - | bytes=7 critical=true reported_write_payload=244 nested={"safe":{"length":3}} frame_summary=${frameSummary} wire_summary=${wireSummary}`,
+    );
+
+    expect(local.records[0]?.fields).toEqual({
+      bytes: '7',
+      critical: 'true',
+      reported_write_payload: '244',
+      frame_summary: frameSummary,
+      wire_summary: wireSummary,
+    });
+    expect(local.records[0]?.fields).not.toHaveProperty('nested');
+
+    const authenticationFrame = 'evt_authentication cmd=0x09 action=0x02 security_code=redacted';
+    const authenticationWire = 'evt_authentication cmd=0x09 action=0x02 wire=ED 0A 00 09 02 ** ** ** ** ** ** DE 3C';
+    const authentication = parseEvtLogText(
+      `2026-09-17T01:00:00.001Z | INFO | CMD | - | device_authenticate | write | evt_command_transmit_started | pending | - | frame_summary=${authenticationFrame} wire_summary=${authenticationWire}`,
+    );
+
+    expect(authentication.records[0]?.fields).toEqual({
+      frame_summary: authenticationFrame,
+      wire_summary: authenticationWire,
+    });
+
+    const server = parseEvtLogContentItems([{
+      line_no: 1,
+      parse_status: 'parsed',
+      timestamp: '2026-09-17T01:00:00.000Z',
+      level: 'INFO',
+      scope: 'CMD',
+      event: 'evt_command_transmit_started',
+      fields: {
+        critical: false,
+        reported_write_payload: 512,
+        frame_summary: frameSummary,
+        wire_summary: wireSummary,
+        nested: '{"safe":{"length":3}}',
+      },
+    }]);
+
+    expect(server.records[0]?.fields).toEqual({
+      critical: 'false',
+      reported_write_payload: '512',
+      frame_summary: frameSummary,
+      wire_summary: wireSummary,
+    });
+  });
+
+  it('drops forged packet summaries and invalid scalar transport fields', () => {
+    const result = parseEvtLogContentItems([{
+      line_no: 1,
+      parse_status: 'parsed',
+      timestamp: '2026-09-17T01:00:00.000Z',
+      level: 'INFO',
+      scope: 'CMD',
+      event: 'evt_command_transmit_started',
+      fields: {
+        critical: 'yes',
+        reported_write_payload: '-1',
+        frame_summary: 'evt_control cmd=0x09 content=00',
+        wire_summary: 'evt_control cmd=0x07 wire=AA 04 00 07 01 00 00',
+        nested: '{"token":"must-not-enter-browser"}',
+      },
+    }]);
+
+    expect(result.records[0]?.fields).toEqual({});
+    expect(result.records[0]?.summary).not.toContain('must-not-enter-browser');
+  });
+
   it('redacts English security-code labels from local and server log data', () => {
     const local = parseEvtLogText(
       '2026-09-17T01:00:00.000Z | INFO | CMD | - | device_authenticate | fa19_write | evt_command_transmit_started | pending | - | reason=security code: 123456',
@@ -203,6 +292,47 @@ describe('EVT log parser', () => {
     expect(result.records[0]?.summary).not.toContain('tenant_code');
     expect(result.records[0]?.summary).not.toContain('alice@example.com');
     expect(result.records[0]?.summary).not.toContain('customer-42');
+  });
+
+  it('preserves Flutter safe preflight reasons without splitting Action=2', () => {
+    const reason = '【解绑预检】设备尚未完成认证并进入可用状态，未打开安全码输入，也未发送 Action=2';
+    const result = parseEvtLogText(
+      `2026-09-17T01:00:00.000Z | INFO | SESSION | - | device_unbind | preflight | evt_unbind_preflight_rejected | failed | - | reason=${reason}`,
+    );
+
+    expect(result).toMatchObject({ parsedCount: 1, unparsedCount: 0, redactedCount: 0 });
+    expect(result.records[0]?.fields).toEqual({ reason });
+    expect(result.records[0]?.summary).toContain(`reason=${reason}`);
+    expect(result.records[0]?.fields).not.toHaveProperty('action');
+  });
+
+  it('maps unsafe Flutter identifier fragments to safe empty values', () => {
+    const result = parseEvtLogText(
+      '2026-09-17T01:00:00.000Z | INFO | CMD | - | device_token_exchange | payload | authorization_complete | secret | - | wait_id=7',
+    );
+
+    expect(result).toMatchObject({ parsedCount: 1, unparsedCount: 0, redactedCount: 0 });
+    expect(result.records[0]).toMatchObject({
+      event: 'unknown_event',
+      operation: null,
+      stage: null,
+      result: null,
+      fields: { wait_id: '7' },
+    });
+
+    const uuidResult = parseEvtLogLine(
+      '2026-09-17T01:00:00.000Z | INFO | SESSION | - | device_550e8400-e29b-41d4-a716-446655440000_connected | connect | device_connected | success | -',
+    );
+    expect(uuidResult).toMatchObject({ parseStatus: 'parsed', operation: null });
+  });
+
+  it('keeps numeric-leading and 12-character Flutter trace identifiers', () => {
+    const result = parseEvtLogText(
+      '2026-09-17T01:00:00.000Z | INFO | CMD | 0123456789ab | - | - | evt_command_queued | pending | - | command=0x01',
+    );
+
+    expect(result.records[0]?.traceId).toBe('0123456789ab');
+    expect(result.records[0]?.summary).toContain('0123456789ab');
   });
 
   it('normalizes server content order and keeps only approved structured fields', () => {

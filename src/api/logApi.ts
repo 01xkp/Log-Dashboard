@@ -17,6 +17,7 @@ export type DiagnosticLogAvailableAction = (typeof diagnosticLogAvailableActions
 export interface DiagnosticLogListItem {
   id: string;
   received_at: string;
+  uploaded_at?: string;
   app_version?: string;
   platform?: string;
   device_ref?: string;
@@ -340,6 +341,7 @@ function validateDiagnosticLogListItem(value: unknown): DiagnosticLogListItem {
   if (!isPlainRecord(value)
     || !isDiagnosticLogIdentifier(value.id)
     || !isUtcIsoTimestamp(value.received_at)
+    || !isOptionalUtcIsoTimestamp(value.uploaded_at)
     || !isDiagnosticLogStatus(value.status)
     || !isOptionalString(value.app_version)
     || !isOptionalString(value.platform)
@@ -356,6 +358,7 @@ function validateDiagnosticLogListItem(value: unknown): DiagnosticLogListItem {
     received_at: value.received_at,
     status: value.status,
   };
+  if (typeof value.uploaded_at === 'string') item.uploaded_at = value.uploaded_at;
   if (typeof value.app_version === 'string') item.app_version = value.app_version;
   if (typeof value.platform === 'string') item.platform = value.platform;
   if (typeof value.device_ref === 'string') item.device_ref = value.device_ref;
@@ -373,6 +376,7 @@ function validateDiagnosticLogDetail(response: unknown, expectedId: string): Dia
     || !isDiagnosticLogStatus(response.status)
     || !isOptionalString(response.source_filename)
     || !isOptionalUtcIsoTimestamp(response.received_at)
+    || !isOptionalUtcIsoTimestamp(response.uploaded_at)
     || !isOptionalNonNegativeNumber(response.bytes)
     || !isOptionalString(response.device_ref)
     || !isOptionalDiagnosticLogAvailableActions(response.available_actions)) {
@@ -385,6 +389,7 @@ function validateDiagnosticLogDetail(response: unknown, expectedId: string): Dia
   };
   if (typeof response.source_filename === 'string') detail.source_filename = response.source_filename;
   if (typeof response.received_at === 'string') detail.received_at = response.received_at;
+  if (typeof response.uploaded_at === 'string') detail.uploaded_at = response.uploaded_at;
   if (typeof response.bytes === 'number') detail.bytes = response.bytes;
   if (typeof response.device_ref === 'string') detail.device_ref = response.device_ref;
   if (Array.isArray(response.available_actions)) {
@@ -560,6 +565,8 @@ function getStableErrorMessage(status: number, code: string | undefined): string
   const byCode: Readonly<Record<string, string>> = {
     invalid_file: '日志文件不符合服务端要求。',
     file_too_large: '日志文件超过服务端允许的大小。',
+    upstream_contract_invalid: '日志服务响应不符合 EVT 看板契约，已停止加载以避免误判。',
+    dashboard_configuration_missing: '看板查询凭证未配置，请使用受保护的 token 启动本地联调。',
     unauthorized: '当前登录状态无效，请重新登录。',
     forbidden: '当前账号没有此日志操作权限。',
     quota_exceeded: '日志服务存储额度已满。',

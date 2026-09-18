@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref } from 'vue';
+import { computed, nextTick, onMounted, ref } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
 import {
   diagnosticLogApi,
@@ -19,6 +19,12 @@ import {
   redactFieldValue,
   sanitizeLogFilename,
 } from './domain/logParser';
+import {
+  createInitialDashboardEntries,
+  mergeServerEntries,
+  preferredDashboardLogTime,
+  shouldShowServerReceivedTime,
+} from './domain/dashboardFiles';
 import type {
   EvtFlowNode,
   EvtFlowStatus,
@@ -37,6 +43,7 @@ interface DashboardLogFile {
   readonly filename: string;
   readonly bytes: number | null;
   readonly receivedAt: string | null;
+  readonly uploadedAt: string | null;
   readonly deviceRef: string | null;
   readonly parseResult: EvtLogParseResult;
   readonly nodes: readonly EvtFlowNode[];
@@ -83,22 +90,32 @@ const EMPTY_PARSE_RESULT: EvtLogParseResult = {
   redactedCount: 0,
 };
 
+type ToastType = 'success' | 'info' | 'warning' | 'error';
+
+function showToast(type: ToastType, message: string): void {
+  ElMessage({
+    type,
+    message,
+    duration: 3200,
+    showClose: true,
+    grouping: true,
+    offset: 16,
+    customClass: 'dashboard-toast',
+  });
+}
+
 const apiBaseUrl = getConfiguredApiBaseUrl();
 const filePicker = ref<HTMLInputElement | null>(null);
 const tableRef = ref<TableExpose | null>(null);
-const files = ref<DashboardLogFile[]>(
-  demoLogSources.map((source) => createDashboardFile({
-    id: source.id,
-    source: 'sample',
-    filename: source.filename,
-    bytes: source.bytes,
-    content: source.content,
-  })),
-);
+const files = ref<DashboardLogFile[]>(createInitialDashboardEntries(
+  Boolean(apiBaseUrl),
+  createDemoFiles(),
+));
 const keyword = ref('');
 const sourceFilter = ref<SourceFilter>('all');
 const statusFilter = ref<StatusFilter>('all');
 const serverLoading = ref(false);
+const loadingServerLogIds = ref<ReadonlySet<string>>(new Set());
 const serverDateRange = ref<string[] | null>(null);
 const serverAppVersion = ref('');
 const serverPlatform = ref('');
@@ -115,10 +132,17 @@ const detailOpen = ref(false);
 const showAllDetailEvents = ref(false);
 let latestServerListRequest = 0;
 
+onMounted(() => {
+  if (apiBaseUrl) {
+    void loadServerPage();
+  }
+});
+
 const statistics = computed(() => {
   const allNodes = files.value.flatMap((file) => file.nodes);
   return {
     files: files.value.length,
+    pending: files.value.filter((file) => overallStatus(file) === 'pending').length,
     success: allNodes.filter((node) => node.status === 'success').length,
     failure: allNodes.filter((node) => node.status === 'failure').length,
     review: allNodes.filter((node) => node.status === 'review').length,
@@ -200,6 +224,7 @@ function createDashboardFile(input: {
   content?: string;
   parseResult?: EvtLogParseResult;
   receivedAt?: string | null;
+  uploadedAt?: string | null;
   deviceRef?: string | null;
   localImportKey?: string;
   serverId?: string;
@@ -221,6 +246,7 @@ function createDashboardFile(input: {
     ),
     bytes: input.bytes,
     receivedAt: input.receivedAt ?? firstRecord?.timestamp ?? null,
+    uploadedAt: input.uploadedAt ?? null,
     deviceRef,
     parseResult,
     nodes,
@@ -230,6 +256,16 @@ function createDashboardFile(input: {
     serverActions: input.serverActions,
     isLoadedFromServer: input.isLoadedFromServer,
   };
+}
+
+function createDemoFiles(): DashboardLogFile[] {
+  return demoLogSources.map((source) => createDashboardFile({
+    id: source.id,
+    source: 'sample',
+    filename: source.filename,
+    bytes: source.bytes,
+    content: source.content,
+  }));
 }
 
 function sanitizeDeviceRef(value: unknown): string | null {
@@ -251,7 +287,13 @@ function matchesFile(file: DashboardLogFile, query: string): boolean {
   if (!query) {
     return true;
   }
-  return [file.filename, file.deviceRef ?? '', file.receivedAt ?? '', file.serverStatus ?? '']
+  return [
+    file.filename,
+    file.deviceRef ?? '',
+    file.receivedAt ?? '',
+    file.uploadedAt ?? '',
+    file.serverStatus ?? '',
+  ]
     .join(' ')
     .toLocaleLowerCase('zh-CN')
     .includes(query);
@@ -285,10 +327,13 @@ function overallStatus(file: DashboardLogFile): FileStatus {
 
 function fileParseSummary(file: DashboardLogFile): string {
   const parts = [
-    sourceLabel(file.source),
     formatBytes(file.bytes),
-    `${file.parseResult.parsedCount} 条已解析`,
   ];
+  if (file.source === 'server' && !file.isLoadedFromServer) {
+    parts.push(isServerLogLoading(file) ? '正在加载内容' : '待加载内容');
+    return parts.join(' · ');
+  }
+  parts.push(`${file.parseResult.parsedCount} 条已解析`);
   if (file.parseResult.unparsedCount > 0) {
     parts.push(`${file.parseResult.unparsedCount} 条未解析`);
   }
@@ -296,6 +341,13 @@ function fileParseSummary(file: DashboardLogFile): string {
     parts.push(`${file.parseResult.redactedCount} 条已隐藏`);
   }
   return parts.join(' · ');
+}
+
+function fileChainSummary(file: DashboardLogFile): string {
+  if (file.source === 'server' && !file.isLoadedFromServer) {
+    return isServerLogLoading(file) ? '加载中' : '待加载';
+  }
+  return `${file.nodes.length} 条链路`;
 }
 
 function statusLabel(status: FileStatus): string {
@@ -324,6 +376,14 @@ function sourceLabel(source: LogSource): string {
   }[source];
 }
 
+function sourceTagType(source: LogSource): 'success' | 'warning' | 'info' {
+  return ({
+    sample: 'info',
+    local: 'warning',
+    server: 'success',
+  } as const)[source];
+}
+
 function formatBytes(bytes: number | null): string {
   if (bytes === null) {
     return '-';
@@ -350,6 +410,17 @@ function formatTime(value: string | null): string {
     timeStyle: 'medium',
     hour12: false,
   }).format(date);
+}
+
+function primaryFileTimeLabel(file: DashboardLogFile): string {
+  if (file.source === 'server') {
+    return file.uploadedAt ? 'App 上传' : '服务器接收';
+  }
+  return '会话';
+}
+
+function formatPrimaryFileTime(file: DashboardLogFile): string {
+  return formatTime(preferredDashboardLogTime(file));
 }
 
 function formatDuration(milliseconds: number | null): string {
@@ -393,11 +464,11 @@ async function importFiles(event: Event): Promise<void> {
       ...files.value.filter((file) => file.source !== 'local' || !importedKeys.has(file.localImportKey)),
     ];
     const parsedLines = imported.reduce((sum, file) => sum + file.parseResult.parsedCount, 0);
-    ElMessage.success(`已导入 ${imported.length} 份日志，解析到 ${parsedLines} 条结构化事件。`);
+    showToast('success', `已导入 ${imported.length} 份日志，解析到 ${parsedLines} 条结构化事件。`);
     await nextTick();
-    setAllExpanded(true);
+    setAllExpanded(false, false);
   } catch {
-    ElMessage.error('日志读取失败，请确认文件为 UTF-8 文本后重试。');
+    showToast('error', '日志读取失败，请确认文件为 UTF-8 文本后重试。');
   } finally {
     importing.value = false;
   }
@@ -410,7 +481,7 @@ async function refreshServer(): Promise<void> {
 
 async function loadServerPage(): Promise<void> {
   if (!apiBaseUrl) {
-    ElMessage.info('未配置 VITE_LOG_API_BASE_URL，当前保持本地分析模式。');
+    showToast('info', '未配置 VITE_LOG_API_BASE_URL，当前保持本地分析模式。');
     return;
   }
 
@@ -435,12 +506,16 @@ async function loadServerPage(): Promise<void> {
       return;
     }
     const serverFiles = response.items.map(createServerPlaceholder);
-    files.value = [...serverFiles, ...files.value.filter((file) => file.source !== 'server')];
+    files.value = mergeServerEntries(serverFiles, files.value);
     serverPage.value = response.page;
     serverPageSize.value = response.page_size;
     serverTotal.value = response.total;
     hasLoadedServerList.value = true;
-    ElMessage.success(`已读取第 ${response.page} 页的 ${serverFiles.length} 份服务器日志。`);
+    if (serverFiles.length > 0) {
+      showToast('success', `已加载服务器第 ${response.page} 页，共 ${serverFiles.length} 份日志。`);
+    } else {
+      showToast('info', '服务器暂无符合当前筛选条件的日志。');
+    }
   } catch (error) {
     if (requestId === latestServerListRequest) {
       showApiError(error);
@@ -456,9 +531,10 @@ function createServerPlaceholder(item: DiagnosticLogListItem): DashboardLogFile 
   return createDashboardFile({
     id: `server:${item.id}`,
     source: 'server',
-    filename: item.id,
+    filename: 'App 上报日志',
     bytes: item.bytes ?? null,
     receivedAt: item.received_at,
+    uploadedAt: item.uploaded_at ?? null,
     deviceRef: item.device_ref,
     parseResult: EMPTY_PARSE_RESULT,
     serverId: item.id,
@@ -467,23 +543,40 @@ function createServerPlaceholder(item: DiagnosticLogListItem): DashboardLogFile 
   });
 }
 
+function isServerLogLoading(file: DashboardLogFile): boolean {
+  return Boolean(file.serverId && loadingServerLogIds.value.has(file.serverId));
+}
+
+function setServerLogLoading(serverId: string, loading: boolean): void {
+  const next = new Set(loadingServerLogIds.value);
+  if (loading) {
+    next.add(serverId);
+  } else {
+    next.delete(serverId);
+  }
+  loadingServerLogIds.value = next;
+}
+
 async function loadServerFile(file: DashboardLogFile): Promise<void> {
-  if (!file.serverId) {
+  const serverId = file.serverId;
+  if (!serverId || isServerLogLoading(file)) {
     return;
   }
   if (!apiBaseUrl) {
-    ElMessage.info('未配置服务端地址，无法读取服务器日志内容。');
+    showToast('info', '未配置服务端地址，无法读取服务器日志内容。');
     return;
   }
 
+  setServerLogLoading(serverId, true);
   try {
-    const detailResponse = await diagnosticLogApi.get(file.serverId);
+    const detailResponse = await diagnosticLogApi.get(serverId);
     const detailFile = createDashboardFile({
       id: file.id,
       source: 'server',
       filename: detailResponse.source_filename ?? file.filename,
       bytes: detailResponse.bytes ?? file.bytes,
       receivedAt: detailResponse.received_at ?? file.receivedAt,
+      uploadedAt: detailResponse.uploaded_at ?? file.uploadedAt,
       deviceRef: detailResponse.device_ref ?? file.deviceRef,
       parseResult: EMPTY_PARSE_RESULT,
       serverId: file.serverId,
@@ -493,17 +586,18 @@ async function loadServerFile(file: DashboardLogFile): Promise<void> {
     });
     files.value = files.value.map((candidate) => candidate.id === file.id ? detailFile : candidate);
     if (!canReadServerContent(detailFile)) {
-      ElMessage.warning(`服务器状态为“${serverStatusLabel(detailResponse.status)}”，当前不可读取日志内容。`);
+      showToast('warning', `服务器状态为“${serverStatusLabel(detailResponse.status)}”，当前不可读取日志内容。`);
       return;
     }
 
-    const items = await loadAllServerContent(file.serverId);
+    const items = await loadAllServerContent(serverId);
     const hydrated = createDashboardFile({
       id: file.id,
       source: 'server',
       filename: detailResponse.source_filename ?? file.filename,
       bytes: detailResponse.bytes ?? file.bytes,
       receivedAt: detailResponse.received_at ?? file.receivedAt,
+      uploadedAt: detailResponse.uploaded_at ?? file.uploadedAt,
       deviceRef: detailResponse.device_ref ?? file.deviceRef,
       parseResult: parseEvtLogContentItems(items),
       serverId: file.serverId,
@@ -512,11 +606,17 @@ async function loadServerFile(file: DashboardLogFile): Promise<void> {
       isLoadedFromServer: true,
     });
     files.value = files.value.map((candidate) => candidate.id === file.id ? hydrated : candidate);
-    ElMessage.success(`已加载 ${hydrated.nodes.length} 条功能链路。`);
+    if (hydrated.nodes.length > 0) {
+      showToast('success', `日志内容已加载：${hydrated.nodes.length} 条链路、${hydrated.parseResult.parsedCount} 条事件。`);
+    } else {
+      showToast('info', '日志内容已加载，但未识别到可展示的结构化链路。');
+    }
     await nextTick();
-    setAllExpanded(true);
+    setAllExpanded(false, false);
   } catch (error) {
     showApiError(error);
+  } finally {
+    setServerLogLoading(serverId, false);
   }
 }
 
@@ -574,23 +674,26 @@ function changeServerPageSize(size: number): void {
 
 function showApiError(error: unknown): void {
   if (error instanceof LogApiContractError) {
-    ElMessage.error(error.message);
+    showToast('error', error.message);
     return;
   }
   if (error instanceof LogApiConfigurationError || error instanceof LogApiRequestError) {
-    ElMessage.error(error.message);
+    showToast('error', error.message);
     return;
   }
   if (error instanceof Error && error.message.startsWith('日志内容')) {
-    ElMessage.warning(error.message);
+    showToast('warning', error.message);
     return;
   }
-  ElMessage.error('日志服务请求失败，请检查网络和服务端状态。');
+  showToast('error', '日志服务请求失败，请检查网络和服务端状态。');
 }
 
-function setAllExpanded(expanded: boolean): void {
+function setAllExpanded(expanded: boolean, announce = true): void {
   for (const row of visibleRows.value) {
     tableRef.value?.toggleRowExpansion?.(row, expanded);
+  }
+  if (announce) {
+    showToast('info', expanded ? '已展开当前日志。' : '已收起当前日志。');
   }
 }
 
@@ -602,8 +705,11 @@ function openDetail(file: DashboardLogFile, node: EvtFlowNode): void {
 
 function handleFileAction(file: DashboardLogFile): void {
   if (file.source === 'server' && !file.isLoadedFromServer) {
+    if (isServerLogLoading(file)) {
+      return;
+    }
     if (!canReadServerContent(file)) {
-      ElMessage.warning(`服务器状态为“${serverStatusLabel(file.serverStatus)}”，当前不可读取日志内容。`);
+      showToast('warning', `服务器状态为“${serverStatusLabel(file.serverStatus)}”，当前不可读取日志内容。`);
       return;
     }
     void loadServerFile(file);
@@ -613,15 +719,22 @@ function handleFileAction(file: DashboardLogFile): void {
   if (firstNode) {
     openDetail(file, firstNode);
   } else {
-    ElMessage.info('当前日志没有可展示的结构化事件。');
+    showToast('info', '当前日志没有可展示的结构化事件。');
   }
 }
 
 function fileActionLabel(file: DashboardLogFile): string {
   if (file.source === 'server' && !file.isLoadedFromServer) {
-    return canReadServerContent(file) ? '加载链路' : '查看状态';
+    if (isServerLogLoading(file)) {
+      return '加载中';
+    }
+    return canReadServerContent(file) ? '加载日志' : '查看状态';
   }
   return '查看链路';
+}
+
+function tableRowClassName({ row }: { row: DashboardTableRow }): string {
+  return row.kind === 'file' ? 'log-file-row' : 'log-node-row';
 }
 
 function downloadServerFile(file: DashboardLogFile): void {
@@ -630,6 +743,7 @@ function downloadServerFile(file: DashboardLogFile): void {
   }
   try {
     window.open(diagnosticLogApi.getDownloadUrl(file.serverId), '_blank', 'noopener,noreferrer');
+    showToast('success', `已开始下载 ${file.filename}。`);
   } catch (error) {
     showApiError(error);
   }
@@ -640,7 +754,7 @@ function removeLocalFile(file: DashboardLogFile): void {
     return;
   }
   files.value = files.value.filter((candidate) => candidate.id !== file.id);
-  ElMessage.success(`已移除 ${file.filename}。`);
+  showToast('success', `已移除 ${file.filename}。`);
 }
 
 function serverStatusLabel(status: string | undefined): string {
@@ -678,7 +792,10 @@ function exportVisibleReport(): void {
 
   for (const row of visibleRows.value) {
     lines.push(`文件：${row.file.filename}`);
-    lines.push(`来源：${sourceLabel(row.file.source)} | 会话时间：${row.file.receivedAt ?? '-'} | 设备引用：${row.file.deviceRef ?? '-'}`);
+    const receivedTime = shouldShowServerReceivedTime(row.file)
+      ? ` | 服务器接收时间：${row.file.receivedAt ?? '-'}`
+      : '';
+    lines.push(`来源：${sourceLabel(row.file.source)} | ${primaryFileTimeLabel(row.file)}时间：${preferredDashboardLogTime(row.file) ?? '-'}${receivedTime} | 设备引用：${row.file.deviceRef ?? '-'}`);
     for (const child of row.children) {
       lines.push(`  [${statusLabel(child.status)}] ${child.node.title}`);
       lines.push(`  结论：${child.node.conclusion}`);
@@ -690,6 +807,7 @@ function exportVisibleReport(): void {
   }
 
   downloadText(`evt-脱敏联调报告-${fileTimestamp()}.txt`, lines.join('\n'));
+  showToast('success', '已导出当前筛选结果。');
 }
 
 function exportDetail(): void {
@@ -707,6 +825,7 @@ function exportDetail(): void {
     ...active.node.records.map((record) => record.summary),
   ];
   downloadText(`evt-脱敏链路-${active.node.category}-${fileTimestamp()}.txt`, lines.join('\n'));
+  showToast('success', '已导出当前功能链路。');
 }
 
 function downloadText(filename: string, content: string): void {
@@ -734,20 +853,14 @@ async function resetLocalLogs(): Promise<void> {
     return;
   }
 
-  files.value = demoLogSources.map((source) => createDashboardFile({
-    id: source.id,
-    source: 'sample',
-    filename: source.filename,
-    bytes: source.bytes,
-    content: source.content,
-  }));
+  files.value = createDemoFiles();
   keyword.value = '';
   sourceFilter.value = 'all';
   statusFilter.value = 'all';
   serverPage.value = 1;
   serverTotal.value = 0;
   hasLoadedServerList.value = false;
-  ElMessage.success('已恢复样例日志。');
+  showToast('success', '已恢复样例日志。');
 }
 </script>
 
@@ -770,9 +883,10 @@ async function resetLocalLogs(): Promise<void> {
 
     <section class="stat-grid" aria-label="日志统计">
       <div class="stat-item"><span>日志文件</span><strong>{{ statistics.files }}</strong></div>
-      <div class="stat-item success"><span>联调成功</span><strong>{{ statistics.success }}</strong></div>
-      <div class="stat-item warning"><span>需要复核</span><strong>{{ statistics.review }}</strong></div>
-      <div class="stat-item danger"><span>联调失败</span><strong>{{ statistics.failure }}</strong></div>
+      <div class="stat-item pending"><span>待分析日志</span><strong>{{ statistics.pending }}</strong></div>
+      <div class="stat-item success"><span>成功链路</span><strong>{{ statistics.success }}</strong></div>
+      <div class="stat-item warning"><span>待复核链路</span><strong>{{ statistics.review }}</strong></div>
+      <div class="stat-item danger"><span>失败链路</span><strong>{{ statistics.failure }}</strong></div>
     </section>
 
     <section class="toolbar-band" aria-label="日志筛选和操作">
@@ -801,7 +915,7 @@ async function resetLocalLogs(): Promise<void> {
         <el-button @click="setAllExpanded(true)">展开全部</el-button>
         <el-button @click="setAllExpanded(false)">收起全部</el-button>
         <el-button @click="exportVisibleReport">导出当前结果</el-button>
-        <el-button @click="resetLocalLogs">恢复样例</el-button>
+        <el-button v-if="!apiBaseUrl" @click="resetLocalLogs">恢复样例</el-button>
       </div>
     </section>
 
@@ -840,10 +954,10 @@ async function resetLocalLogs(): Promise<void> {
     <section class="table-band" aria-labelledby="table-title">
       <div class="section-heading">
         <div>
-          <h2 id="table-title">联调日志</h2>
-          <p>状态只依据当前日志证据判定；未见完整终态时显示“需要复核”。</p>
+          <h2 id="table-title">日志列表</h2>
+          <p>展开日志可查看功能链路和事件；结果由日志内容自动分析。</p>
         </div>
-        <span class="result-count">{{ visibleRows.length }} 份日志</span>
+        <span class="result-count">当前显示 {{ visibleRows.length }} 份</span>
       </div>
 
       <el-table
@@ -851,15 +965,18 @@ async function resetLocalLogs(): Promise<void> {
         :data="visibleRows"
         row-key="id"
         :tree-props="{ children: 'children' }"
-        default-expand-all
+        :row-class-name="tableRowClassName"
         class="log-table"
         empty-text="没有匹配的日志或功能链路"
       >
-        <el-table-column label="日志文件 / 功能链路" min-width="310">
+        <el-table-column label="日志 / 功能链路" min-width="330">
           <template #default="{ row }: { row: DashboardTableRow }">
             <template v-if="row.kind === 'file'">
               <div class="file-cell">
-                <strong>{{ row.file.filename }}</strong>
+                <div class="file-title-line">
+                  <strong>{{ row.file.filename }}</strong>
+                  <el-tag size="small" effect="plain" :type="sourceTagType(row.file.source)">{{ sourceLabel(row.file.source) }}</el-tag>
+                </div>
                 <span>{{ fileParseSummary(row.file) }}<template v-if="row.file.source === 'server'"> · 服务器{{ serverStatusLabel(row.file.serverStatus) }}</template></span>
               </div>
             </template>
@@ -872,30 +989,35 @@ async function resetLocalLogs(): Promise<void> {
           </template>
         </el-table-column>
 
-        <el-table-column label="会话时间" min-width="180">
+        <el-table-column label="时间" min-width="250">
           <template #default="{ row }: { row: DashboardTableRow }">
-            <template v-if="row.kind === 'file'">{{ formatTime(row.file.receivedAt) }}</template>
+            <template v-if="row.kind === 'file'">
+              <div class="file-time-cell">
+                <span>{{ primaryFileTimeLabel(row.file) }}时间 {{ formatPrimaryFileTime(row.file) }}</span>
+                <span v-if="shouldShowServerReceivedTime(row.file)" class="muted">服务器接收 {{ formatTime(row.file.receivedAt) }}</span>
+              </div>
+            </template>
             <template v-else>{{ formatTime(row.node.startedAt) }}<br><span class="muted">{{ formatDuration(row.node.durationMs) }}</span></template>
           </template>
         </el-table-column>
 
         <el-table-column label="设备引用" min-width="130">
           <template #default="{ row }: { row: DashboardTableRow }">
-            {{ row.file.deviceRef ?? '-' }}
+            {{ row.kind === 'file' ? row.file.deviceRef ?? '-' : '-' }}
           </template>
         </el-table-column>
 
-        <el-table-column label="App 下发 / 设备回包" min-width="165">
+        <el-table-column label="交互统计" min-width="165">
           <template #default="{ row }: { row: DashboardTableRow }">
             <template v-if="row.kind === 'node'">
               App {{ row.node.directionCounts.app }} · 设备 {{ row.node.directionCounts.device }}<br>
               <span class="muted">系统 {{ row.node.directionCounts.system }}</span>
             </template>
-            <template v-else>{{ row.file.nodes.length }} 条功能链路</template>
+            <template v-else>{{ fileChainSummary(row.file) }}</template>
           </template>
         </el-table-column>
 
-        <el-table-column label="联调状态" min-width="130">
+        <el-table-column label="分析结果" min-width="130">
           <template #default="{ row }: { row: DashboardTableRow }">
             <el-tag :type="statusTagType(row.status)" effect="light">{{ statusLabel(row.status) }}</el-tag>
           </template>
@@ -907,7 +1029,13 @@ async function resetLocalLogs(): Promise<void> {
               <el-button link type="primary" @click="openDetail(row.file, row.node)">查看详情</el-button>
             </template>
             <template v-else>
-              <el-button link type="primary" @click="handleFileAction(row.file)">
+              <el-button
+                link
+                type="primary"
+                :loading="isServerLogLoading(row.file)"
+                :disabled="isServerLogLoading(row.file)"
+                @click="handleFileAction(row.file)"
+              >
                 {{ fileActionLabel(row.file) }}
               </el-button>
               <el-button v-if="canDownloadServerFile(row.file)" link type="primary" @click="downloadServerFile(row.file)">下载</el-button>
@@ -922,7 +1050,10 @@ async function resetLocalLogs(): Promise<void> {
         <article v-for="row in visibleRows" v-else :key="row.id" class="mobile-log-card">
           <div class="mobile-file-header">
             <div class="mobile-file-title">
-              <strong>{{ row.file.filename }}</strong>
+              <div class="file-title-line">
+                <strong>{{ row.file.filename }}</strong>
+                <el-tag size="small" effect="plain" :type="sourceTagType(row.file.source)">{{ sourceLabel(row.file.source) }}</el-tag>
+              </div>
               <span>{{ fileParseSummary(row.file) }}</span>
             </div>
             <el-tag :type="statusTagType(row.status)" effect="light">{{ statusLabel(row.status) }}</el-tag>
@@ -930,7 +1061,11 @@ async function resetLocalLogs(): Promise<void> {
 
           <dl class="mobile-file-meta">
             <div>
-              <dt>会话时间</dt>
+              <dt>{{ primaryFileTimeLabel(row.file) }}时间</dt>
+              <dd>{{ formatPrimaryFileTime(row.file) }}</dd>
+            </div>
+            <div v-if="shouldShowServerReceivedTime(row.file)">
+              <dt>服务器接收时间</dt>
               <dd>{{ formatTime(row.file.receivedAt) }}</dd>
             </div>
             <div>
@@ -939,7 +1074,7 @@ async function resetLocalLogs(): Promise<void> {
             </div>
             <div>
               <dt>功能链路</dt>
-              <dd>{{ row.children.length }} 条</dd>
+              <dd>{{ fileChainSummary(row.file) }}</dd>
             </div>
             <div v-if="row.file.source === 'server'">
               <dt>服务器状态</dt>
@@ -948,7 +1083,13 @@ async function resetLocalLogs(): Promise<void> {
           </dl>
 
           <div class="mobile-file-actions">
-            <el-button type="primary" plain @click="handleFileAction(row.file)">
+            <el-button
+              type="primary"
+              plain
+              :loading="isServerLogLoading(row.file)"
+              :disabled="isServerLogLoading(row.file)"
+              @click="handleFileAction(row.file)"
+            >
               {{ fileActionLabel(row.file) }}
             </el-button>
             <el-button v-if="canDownloadServerFile(row.file)" @click="downloadServerFile(row.file)">下载日志</el-button>
@@ -973,7 +1114,9 @@ async function resetLocalLogs(): Promise<void> {
             </article>
           </div>
           <p v-else class="mobile-empty-chain">
-            {{ row.file.source === 'server' && !row.file.isLoadedFromServer ? '尚未加载服务器日志内容。' : '当前日志没有可展示的结构化功能链路。' }}
+            {{ row.file.source === 'server' && !row.file.isLoadedFromServer
+              ? isServerLogLoading(row.file) ? '正在从服务器读取日志内容。' : '尚未加载服务器日志内容。'
+              : '当前日志没有可展示的结构化功能链路。' }}
           </p>
         </article>
       </div>
@@ -1133,7 +1276,7 @@ h3 {
 
 .stat-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 12px;
   margin: 16px 0;
 }
@@ -1162,6 +1305,7 @@ h3 {
 }
 
 .stat-item.success { border-top-color: #237546; }
+.stat-item.pending { border-top-color: #64748b; }
 .stat-item.warning { border-top-color: #b15d00; }
 .stat-item.danger { border-top-color: #b3261e; }
 
@@ -1273,6 +1417,30 @@ h3 {
   min-width: 0;
 }
 
+.file-time-cell {
+  display: grid;
+  gap: 2px;
+  line-height: 1.45;
+  white-space: nowrap;
+}
+
+.file-title-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.file-title-line strong {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.file-title-line :deep(.el-tag) {
+  flex: 0 0 auto;
+  font-weight: 500;
+}
+
 .file-cell strong,
 .node-cell strong {
   overflow: hidden;
@@ -1282,6 +1450,18 @@ h3 {
 
 .node-cell strong {
   color: #0c5e59;
+}
+
+:deep(.log-table .log-file-row > td) {
+  background: #f7fbfa;
+}
+
+:deep(.log-table .log-file-row > td:first-child) {
+  border-left: 3px solid #0c6d66;
+}
+
+:deep(.log-table .log-node-row > td:first-child) {
+  background: #fcfdfd;
 }
 
 .safety-band {
@@ -1385,7 +1565,7 @@ h3 {
   .toolbar-band { flex-direction: column; }
   .mode-panel { justify-items: start; }
   .mode-address { text-align: left; }
-  .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stat-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .filter-group,
   .action-group { width: 100%; }
   .server-filter-controls :deep(.el-date-editor) { width: 100%; }

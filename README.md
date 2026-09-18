@@ -11,6 +11,14 @@ npm.cmd run dev
 
 默认在本地分析模式运行，不会访问网络。配置 `VITE_LOG_API_BASE_URL` 后可使用服务端列表、详情和内容接口；浏览器不会直连 SFTP，也不保存服务器账号或私钥。
 
+本机联调可以让 Vite 读取中间层在服务端读取 `EVT_LOG_DASHBOARD_TOKEN`，Vue 只访问同源的 `/api/v1/diagnostic-logs`。不要把该 token 写成 `VITE_*` 变量。中间层会在服务端过滤空字段，并将当前服务的旧内容格式转为脱敏结构化事件，原始日志行不会进入 Vue 状态。Node 20+ 的启动示例：
+
+```powershell
+node --env-file=<受保护的token文件> node_modules/vite/bin/vite.js --host 127.0.0.1 --port 5173
+```
+
+`.env.local` 在此模式下应为 `VITE_LOG_API_BASE_URL=http://localhost:5173`。该中间层仅适合本机联调；生产环境仍应使用 SSO/HttpOnly Cookie 或独立 BFF。
+
 服务端环境变量、接口路径、分页和脱敏边界见[服务端对接说明](docs/server-integration.md)。
 
 服务端模式中，列表默认每页 20 份，可按接收时间、App 版本、平台、设备引用、错误码、保存状态和关键字筛选并分页。只有服务端返回 <code>stored</code> 状态且授权读取的日志可以加载链路；下载还需要明确的 <code>download</code> 权限。

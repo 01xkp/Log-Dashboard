@@ -38,6 +38,7 @@ export const EVT_LOG_SAFE_FIELD_KEYS = [
   'count',
   'crc',
   'crc32',
+  'critical',
   'current_operation',
   'cycle',
   'device_file_state',
@@ -65,6 +66,7 @@ export const EVT_LOG_SAFE_FIELD_KEYS = [
   'file_state',
   'file_transfer',
   'foreground_before',
+  'frame_summary',
   'free_mb',
   'gatt_cache_refresh_attempted',
   'gatt_cache_refresh_result',
@@ -115,6 +117,7 @@ export const EVT_LOG_SAFE_FIELD_KEYS = [
   'record_mode',
   'record_status',
   'record_type',
+  'reported_write_payload',
   'received_bytes',
   'reconnect_paused_for_background',
   'rejected_frames',
@@ -156,6 +159,10 @@ export const EVT_LOG_SAFE_FIELD_KEYS = [
   'variant',
   'wait_id',
   'window',
+  'wire_summary',
+  // Flutter's `nested` field is an app-private recursively sanitized map.
+  // The dashboard API only admits scalar fields, so it must never enter UI
+  // state as a rehydrated JSON object.
 ] as const;
 
 export type EvtLogSafeFieldKey = (typeof EVT_LOG_SAFE_FIELD_KEYS)[number];
